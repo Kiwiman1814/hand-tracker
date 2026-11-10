@@ -24,6 +24,8 @@
   button { font:inherit; color:var(--text); background:#1c2733; border:1px solid #2c3a4a;
            border-radius:10px; padding:8px 12px; }
   button:active { background:#2c3a4a; }
+  #view3d { position:fixed; inset:0; width:100%; height:100%; display:none; touch-action:none;
+            background:rgba(11,15,20,.88); }
   #hint { flex-basis:100%; font-size:13px; line-height:1.3; }
   #zoomRow { flex-basis:100%; display:flex; align-items:center; gap:8px; font-size:13px; color:var(--dim); }
   #zoom { flex:1; accent-color:var(--accent); }
@@ -58,11 +60,14 @@
   <canvas id="overlay"></canvas>
 </div>
 
+<canvas id="view3d"></canvas>
+
 <div id="topbar">
   <span id="status">Idle</span>
   <button id="resetBtn">Reset</button>
   <button id="nextBtn">Next</button>
   <button id="flipBtn">Flip</button>
+  <button id="modeBtn">3D</button>
   <div id="zoomRow"><span>Zoom</span><input id="zoom" type="range" min="1" max="3" step="0.1" value="1"><span id="zoomLabel">1.0×</span></div>
   <div id="hint"></div>
 </div>
@@ -73,7 +78,7 @@
 
 <div id="start">
   <h1>Hand Tracker</h1>
-  <p>Tracks up to two hands with your phone camera and shows how much each finger is curled (0 % = straight, 100 % = fist). Pinch thumb and index finger together on a block to pick it up, then solve the puzzles by getting every block onto the square of its own colour.</p>
+  <p>Tracks up to two hands with your phone camera and shows how much each finger is curled (0 % = straight, 100 % = fist). Pinch thumb and index finger together on a block to pick it up, then solve the puzzles by getting every block onto the square of its own colour. The 3D button shows your hand as a wire mesh next to a robot hand that copies it.</p>
   <button id="startBtn">Start camera</button>
   <p><small>This is just a test, not a current project.</small></p>
   <p id="error"></p>
@@ -88,6 +93,7 @@
 //    2. Load Google's MediaPipe hand model  (loadModel)
 //    3. Every frame: ask the model for 21 points per hand   (loop)
 //    4. Turn the points into "finger curl %" and draw everything (fingerCurl, draw)
+//    5. Optional 3D view of the hand and a robot hand copying it (buildHand, render3d)
 //
 //  The 21 points ("landmarks") are numbered like this:
 //      0 = wrist
@@ -289,6 +295,7 @@ let won        = false;
 let nextTimer  = 0;
 let isPinching = [false, false];  // per hand: is it pinching right now?
 let held       = [null, null];    // per hand: { block, dx, dy } while carrying a block
+let mode       = "game";          // "game" = block puzzles, "3d" = the 3D hand view
 let screenZoom = 1;               // picture enlarged on screen (only when the camera can't zoom itself)
 
 // The camera picture is cropped to fill the screen, and the bars at the top and
@@ -323,7 +330,7 @@ function loadLevel(n) {
 
   held = [null, null];
   won = false;
-  hintEl.textContent = `Level ${level + 1}/${LEVELS.length} · ${L.name}: ${L.hint}`;
+  if (mode === "game") hintEl.textContent = `Level ${level + 1}/${LEVELS.length} · ${L.name}: ${L.hint}`;
   bannerEl.style.display = "none";
 }
 
@@ -464,6 +471,7 @@ function draw(result, hands) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const w = canvas.width, h = canvas.height;
 
+  if (mode === "game") {     // (the level is not drawn in the 3D view)
   // The level first, so the hand skeleton is drawn on top of it.
   ctx.strokeStyle = "rgba(255,255,255,.35)";                 // edge of the play area
   ctx.lineWidth = 1.5;
@@ -512,6 +520,7 @@ function draw(result, hands) {
     ctx.lineWidth = 2;
     ctx.stroke();
     if (hand.pinch.active) { ctx.fillStyle = "#ffffff"; ctx.fill(); }
+  }
   }
 
   result.landmarks.forEach((points, handIndex) => {
@@ -608,8 +617,9 @@ function loop() {
   const now = performance.now();
   const dt = Math.min(0.05, (now - lastPhysicsTime) / 1000);
   lastPhysicsTime = now;
-  physics(dt, hands);
+  if (mode === "game") physics(dt, hands);
   draw(result, hands);
+  if (mode === "3d") render3d(result.worldLandmarks[0]);
 
   window.handData = hands;
   updatePanel(hands);
@@ -622,6 +632,199 @@ function loop() {
     statusEl.textContent = `${fps} FPS · ${hands.length} hand${hands.length === 1 ? "" : "s"}`;
   }
 }
+
+// ----------------------------- 5. 3D VIEW ------------------------------------
+// A second screen (the "3D" button) that shows two models side by side:
+//   - your hand as a wire mesh
+//   - a simple robot hand that copies the same pose
+// Both are built from the same 21 points, using the three.js 3D library.
+// The model gives the points in metres with the middle of the hand as the
+// centre, so the models turn when your hand turns.
+const view3d  = document.getElementById("view3d");
+const modeBtn = document.getElementById("modeBtn");
+const UNITS   = 10;               // 1 unit in the 3D world = 10 cm
+const FINGER_PARTS = [            // every finger bone: [from landmark, to landmark]
+  [1,2],[2,3],[3,4],  [5,6],[6,7],[7,8],  [9,10],[10,11],[11,12],
+  [13,14],[14,15],[15,16],  [17,18],[18,19],[19,20] ];
+const PALM_CORNERS = [0, 1, 5, 9, 13, 17];
+
+let THREE = null;                 // the 3D library, downloaded the first time you open the 3D view
+let renderer, scene, camera3d, wireHand, robotHand;
+let pose = null;                  // the 21 points as smoothed 3D vectors
+let spin = { yaw: 0, pitch: 0 };  // extra rotation from dragging with a finger
+
+async function init3d() {
+  THREE = await import("https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js");
+  renderer = new THREE.WebGLRenderer({ canvas: view3d, alpha: true, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  scene    = new THREE.Scene();
+  camera3d = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 1.6));     // soft light from above
+  const lamp = new THREE.DirectionalLight(0xffffff, 2);              // plus one lamp for shading
+  lamp.position.set(2, 4, 6);
+  scene.add(lamp);
+
+  wireHand  = buildHand(true);
+  robotHand = buildHand(false);
+  scene.add(wireHand.group, robotHand.group);
+
+  // Drag with a finger (or the mouse) to turn the models.
+  let last = null;
+  view3d.onpointerdown = (e) => { last = { x: e.clientX, y: e.clientY }; view3d.setPointerCapture(e.pointerId); };
+  view3d.onpointermove = (e) => {
+    if (!last) return;
+    spin.yaw   += (e.clientX - last.x) * 0.01;
+    spin.pitch += (e.clientY - last.y) * 0.01;
+    last = { x: e.clientX, y: e.clientY };
+  };
+  view3d.onpointerup = view3d.onpointercancel = () => { last = null; };
+}
+
+// Builds one hand model. wire = true gives the green wire mesh,
+// wire = false gives the robot hand made of boxes.
+// Returns the model and an update(points) function that poses it.
+function buildHand(wire) {
+  const group = new THREE.Group();
+  const material = (color) => wire
+    ? new THREE.MeshBasicMaterial({ color: 0x35d0a5, wireframe: true })
+    : new THREE.MeshStandardMaterial({ color, roughness: 0.45, metalness: 0.2 });
+  const add = (shape, color) => { const m = new THREE.Mesh(shape, material(color)); group.add(m); return m; };
+
+  // Finger bones: tubes for the wire hand, boxes for the robot (green fingertips).
+  const partShape = wire ? new THREE.CylinderGeometry(0.5, 0.5, 1, 6, 1, true) : new THREE.BoxGeometry(1, 1, 1);
+  const parts = FINGER_PARTS.map(([a, b]) => add(partShape, b % 4 === 0 ? 0x35d0a5 : 0xc9d1d9));
+
+  // Joints: a ball on every point (the robot has none on the fingertips and wrist).
+  const jointShape = wire ? new THREE.IcosahedronGeometry(0.5, 0) : new THREE.SphereGeometry(0.5, 12, 8);
+  const joints = [];
+  for (let id = 0; id < 21; id++) {
+    if (!wire && id % 4 === 0) continue;
+    const ball = add(jointShape, 0x30363d);
+    ball.scale.setScalar(wire ? 0.12 : 0.21);
+    joints.push({ id, ball });
+  }
+
+  // Palm: a flat mesh between the palm points (wire), or a plate plus a wrist cuff (robot).
+  let palm, cuff;
+  if (wire) {
+    const shape = new THREE.BufferGeometry();
+    shape.setAttribute("position", new THREE.BufferAttribute(new Float32Array(PALM_CORNERS.length * 3), 3));
+    shape.setIndex([0,1,2, 0,2,3, 0,3,4, 0,4,5]);          // four triangles fanning out from the wrist
+    palm = add(shape);
+  } else {
+    palm = add(partShape, 0xc9d1d9);
+    cuff = add(partShape, 0x30363d);
+  }
+
+  // Put a tube/box between points a and b. `refs` are directions used to
+  // decide which way its flat side faces (the first usable one wins).
+  function placeBetween(mesh, a, b, thick, refs, shorten) {
+    const dir = b.clone().sub(a);
+    const length = dir.length();
+    dir.normalize();
+    let x;
+    for (const ref of refs) {
+      x = ref.clone().addScaledVector(dir, -ref.dot(dir));   // the part of ref that is square to the bone
+      if (x.length() > 0.3) break;
+    }
+    x.normalize();
+    const z = new THREE.Vector3().crossVectors(x, dir);
+    mesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, dir, z));
+    mesh.position.copy(a).add(b).multiplyScalar(0.5);        // halfway between a and b
+    mesh.scale.set(thick, length * shorten, thick);
+  }
+
+  function update(P) {
+    // The palm's own directions: up (wrist -> middle knuckle), side (pinky -> index) and out of the palm.
+    const up     = P[9].clone().sub(P[0]).normalize();
+    const side   = P[5].clone().sub(P[17]);
+    side.addScaledVector(up, -side.dot(up)).normalize();
+    const normal = new THREE.Vector3().crossVectors(side, up);
+
+    parts.forEach((mesh, i) => {
+      const [a, b] = FINGER_PARTS[i], thumb = a < 5;
+      placeBetween(mesh, P[a], P[b], thumb ? 0.2 : 0.17,
+                   thumb ? [normal, up] : [side, normal], wire ? 1 : 0.8);   // robot bones are a bit short, so you see the joints
+    });
+    for (const j of joints) j.ball.position.copy(P[j.id]);
+
+    if (wire) {
+      const pos = palm.geometry.attributes.position;
+      PALM_CORNERS.forEach((id, i) => pos.setXYZ(i, P[id].x, P[id].y, P[id].z));
+      pos.needsUpdate = true;
+    } else {
+      const knuckles = P[5].clone().add(P[9]).add(P[13]).add(P[17]).multiplyScalar(0.25);
+      const turn = new THREE.Matrix4().makeBasis(side, up, normal);
+      palm.quaternion.setFromRotationMatrix(turn);
+      palm.position.copy(P[0]).add(knuckles).multiplyScalar(0.5);
+      palm.scale.set(P[5].distanceTo(P[17]) + 0.2, knuckles.distanceTo(P[0]), 0.28);
+      cuff.quaternion.setFromRotationMatrix(turn);
+      cuff.position.copy(P[0]).addScaledVector(up, -0.35);
+      cuff.scale.set(0.6, 0.6, 0.42);
+    }
+    group.rotation.set(spin.pitch, spin.yaw, 0);
+  }
+  return { group, update };
+}
+
+// Place the two models and the camera so both fit between the top and bottom bars.
+function layout3d() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h, false);
+  camera3d.aspect = w / h;
+  camera3d.updateProjectionMatrix();
+
+  const top = topbar.getBoundingClientRect().bottom, bottom = panel.getBoundingClientRect().top;
+  const free = Math.max(0.2, (bottom - top) / h);            // share of the screen height that is free
+  const stacked = w < bottom - top;                          // tall screen: one above the other
+  wireHand.group.position.set(stacked ? 0 : -1.5, stacked ? 1.35 : 0, 0);
+  robotHand.group.position.set(stacked ? 0 : 1.5, stacked ? -1.35 : 0, 0);
+
+  // How many units tall the camera must see, then how far back it has to stand.
+  const tall = stacked ? Math.max(5.6 / free, 2.8 * h / w) : Math.max(2.9 / free, 6 * h / w);
+  const shift = ((top + bottom) / 2 - h / 2) / h * tall;     // the free area is not exactly mid-screen
+  camera3d.position.set(0, shift, tall / 2 / Math.tan(20 * Math.PI / 180));
+}
+
+// Called every frame in 3D mode with the first hand's 3D points (or nothing).
+function render3d(points) {
+  if (points) {
+    const mirror = facingMode === "user" ? -1 : 1;           // selfie camera: flip like a mirror
+    if (!pose) pose = points.map(() => new THREE.Vector3());
+    points.forEach((p, i) => {
+      // The model's y points down and z points away; three.js wants y up and z towards you.
+      const target = new THREE.Vector3(p.x * mirror, -p.y, -p.z).multiplyScalar(UNITS);
+      pose[i].lerp(target, 1 - SMOOTHING);
+    });
+  }
+  if (pose) { wireHand.update(pose); robotHand.update(pose); }
+  wireHand.group.visible = robotHand.group.visible = !!pose;
+  renderer.render(scene, camera3d);
+}
+
+// Switch between the block game and the 3D view.
+async function setMode(newMode) {
+  if (newMode === "3d" && !THREE) {
+    modeBtn.textContent = "…";
+    try { await init3d(); }
+    catch (e) { console.error(e); statusEl.textContent = "3D view failed to load"; modeBtn.textContent = "3D"; return; }
+  }
+  mode = newMode;
+  const is3d = mode === "3d";
+  view3d.style.display = is3d ? "block" : "none";
+  document.getElementById("resetBtn").style.display = document.getElementById("nextBtn").style.display = is3d ? "none" : "";
+  modeBtn.textContent = is3d ? "Game" : "3D";
+  if (is3d) {
+    clearTimeout(nextTimer);
+    bannerEl.style.display = "none";
+    hintEl.textContent = "3D view · your hand as a wire mesh, and a robot hand copying it. Drag to rotate.";
+    layout3d();
+  } else {
+    loadLevel(won ? level + 1 : level);
+  }
+}
+modeBtn.onclick = () => setMode(mode === "game" ? "3d" : "game");
 
 // ----------------------------- ZOOM ------------------------------------------
 // Two ways to zoom:
@@ -647,7 +850,7 @@ function setupZoom() {
     zoomEl.min = 1; zoomEl.max = 3; zoomEl.step = 0.1; zoomEl.value = 1;
   }
   zoomLabel.textContent = Number(zoomEl.value).toFixed(1) + "×";
-  if (handLandmarker) loadLevel(level);
+  if (handLandmarker && mode === "game") loadLevel(level);
 }
 
 // While dragging the slider.
@@ -663,7 +866,7 @@ zoomEl.oninput = () => {
 };
 // When the slider is let go: with screen zoom less of the picture is visible,
 // so rebuild the level to fit what you can see.
-zoomEl.onchange = () => { if (!zoomTrack && handLandmarker) loadLevel(level); };
+zoomEl.onchange = () => { if (!zoomTrack && handLandmarker && mode === "game") loadLevel(level); };
 
 // ----------------------------- BUTTONS ---------------------------------------
 document.getElementById("startBtn").onclick = async () => {
@@ -697,7 +900,10 @@ document.getElementById("flipBtn").onclick = async () => {
 document.getElementById("resetBtn").onclick = () => loadLevel(level);       // restart this level
 document.getElementById("nextBtn").onclick  = () => loadLevel(level + 1);   // skip to the next one
 // Turning the phone changes the play area, so rebuild the level to fit.
-window.addEventListener("resize", () => { if (canvas.width > 1 && video.videoWidth) loadLevel(level); });
+window.addEventListener("resize", () => {
+  if (mode === "3d") layout3d();
+  else if (video.videoWidth) loadLevel(level);
+});
 
 buildPanel();
 </script>
