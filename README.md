@@ -11,4 +11,8 @@ Hand tracking that runs entirely in the phone browser (MediaPipe Hand Landmarker
 - 3D view: your hand as a wire mesh next to a simple robot hand that copies the pose
 - Nothing is uploaded; the camera picture stays on the device
 
+- Spell page: fist then open hand = fireball, point = lightning, two fingers = frost, fast open-hand swipe = gust
+
 Open it: https://kiwiman1814.github.io/hand-tracker/
+
+Spells: https://kiwiman1814.github.io/hand-tracker/spells.html
