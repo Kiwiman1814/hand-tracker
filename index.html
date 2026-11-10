@@ -17,13 +17,20 @@
   /* Front camera is shown mirrored so it feels like a mirror. */
   .mirrored { transform: scaleX(-1); }
 
-  #topbar { position:fixed; top:0; left:0; right:0; display:flex; gap:8px; align-items:center;
+  #topbar { position:fixed; top:0; left:0; right:0; display:flex; flex-wrap:wrap; gap:6px 8px; align-items:center;
             padding: calc(env(safe-area-inset-top) + 8px) 12px 8px; background:var(--panel);
             backdrop-filter: blur(8px); font-size:14px; }
   #status { flex:1; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   button { font:inherit; color:var(--text); background:#1c2733; border:1px solid #2c3a4a;
            border-radius:10px; padding:8px 12px; }
   button:active { background:#2c3a4a; }
+  #hint { flex-basis:100%; font-size:13px; line-height:1.3; }
+  #zoomRow { flex-basis:100%; display:flex; align-items:center; gap:8px; font-size:13px; color:var(--dim); }
+  #zoom { flex:1; accent-color:var(--accent); }
+  #zoomLabel { width:36px; text-align:right; font-variant-numeric: tabular-nums; }
+  #banner { position:fixed; left:50%; top:45%; transform:translate(-50%,-50%); display:none; z-index:5;
+            background:var(--accent); color:#04261c; font-weight:700; font-size:22px;
+            padding:14px 22px; border-radius:14px; white-space:nowrap; }
 
   #panel { position:fixed; left:0; right:0; bottom:0; display:flex; gap:10px;
            padding: 10px 12px calc(env(safe-area-inset-bottom) + 10px); background:var(--panel);
@@ -53,15 +60,20 @@
 
 <div id="topbar">
   <span id="status">Idle</span>
-  <button id="resetBtn">Reset blocks</button>
-  <button id="flipBtn">Flip camera</button>
+  <button id="resetBtn">Reset</button>
+  <button id="nextBtn">Next</button>
+  <button id="flipBtn">Flip</button>
+  <div id="zoomRow"><span>Zoom</span><input id="zoom" type="range" min="1" max="3" step="0.1" value="1"><span id="zoomLabel">1.0×</span></div>
+  <div id="hint"></div>
 </div>
+
+<div id="banner"></div>
 
 <div id="panel"></div>
 
 <div id="start">
   <h1>Hand Tracker</h1>
-  <p>Tracks up to two hands with your phone camera and shows how much each finger is curled (0 % = straight, 100 % = fist). Pinch thumb and index finger together on a block to pick it up and move it.</p>
+  <p>Tracks up to two hands with your phone camera and shows how much each finger is curled (0 % = straight, 100 % = fist). Pinch thumb and index finger together on a block to pick it up, then solve the puzzles by getting every block onto the square of its own colour.</p>
   <button id="startBtn">Start camera</button>
   <p><small>This is just a test, not a current project.</small></p>
   <p id="error"></p>
@@ -100,7 +112,48 @@ const CAM_HEIGHT  = 480;
 // Two numbers (instead of one) stop the pinch flickering on/off at the limit.
 const PINCH_ON    = 0.30;   // gap smaller than this  -> pinch starts
 const PINCH_OFF   = 0.45;   // gap bigger than this   -> pinch lets go
-const BLOCK_COLORS = ["#ff6b6b", "#4dabf7", "#ffd43b", "#b197fc"];  // one block per colour
+
+// Physics. Speeds are counted in "block widths per second".
+const BLOCK_SIZE  = 0.15;   // block side, as a fraction of the play area's short side
+const FRICTION    = 2.2;    // higher = blocks stop sooner after a throw
+const BOUNCE      = 0.4;    // 0 = dead stop on impact, 1 = perfect bounce
+const FOLLOW      = 18;     // how hard a held block is pulled to your fingers
+const MAX_SPEED   = 30;     // speed limit
+
+const COLORS = { red: "#ff6b6b", blue: "#4dabf7", yellow: "#ffd43b", purple: "#b197fc", grey: "#adb5bd" };
+
+// THE PUZZLES. Add your own by copying one!
+// All positions are fractions of the play area: [0,0] = top-left, [1,1] = bottom-right.
+//   blocks: { color, at:[x,y] }            (a "grey" block cannot be pinched, only pushed)
+//   goals:  { color, at:[x,y], size }      (size in block widths, default 1.7)
+//   walls:  [x, y, width, height]          (blocks cannot pass)
+//   noGrab: [x, y, width, height]          (your hand drops blocks in here)
+// A level is solved when every goal has a resting block of its own colour on it.
+const LEVELS = [
+  { name: "Match", hint: "Pinch a block and drop it on the square of the same colour.",
+    blocks: [{ color: "red", at: [0.3, 0.25] }, { color: "blue", at: [0.7, 0.25] }],
+    goals:  [{ color: "red", at: [0.7, 0.75] }, { color: "blue", at: [0.3, 0.75] }] },
+
+  { name: "Four corners", hint: "Each block goes to its own corner.",
+    blocks: [{ color: "red", at: [0.4, 0.42] }, { color: "blue", at: [0.6, 0.42] },
+             { color: "yellow", at: [0.4, 0.58] }, { color: "purple", at: [0.6, 0.58] }],
+    goals:  [{ color: "purple", at: [0.2, 0.12] }, { color: "yellow", at: [0.8, 0.12] },
+             { color: "blue", at: [0.2, 0.88] }, { color: "red", at: [0.8, 0.88] }] },
+
+  { name: "Around the wall", hint: "Blocks can't go through walls. Find the way around.",
+    blocks: [{ color: "red", at: [0.2, 0.2] }, { color: "yellow", at: [0.5, 0.2] }],
+    goals:  [{ color: "red", at: [0.2, 0.8] }, { color: "yellow", at: [0.5, 0.62] }],
+    walls:  [[0, 0.42, 0.7, 0.04], [0.3, 0.72, 0.7, 0.04]] },
+
+  { name: "Slide", hint: "Your hand can't hold blocks in the red zone. Throw them so they slide in.",
+    blocks: [{ color: "blue", at: [0.3, 0.15] }, { color: "purple", at: [0.7, 0.15] }],
+    goals:  [{ color: "blue", at: [0.7, 0.8], size: 2.6 }, { color: "purple", at: [0.3, 0.8], size: 2.6 }],
+    noGrab: [[0, 0.45, 1, 0.55]] },
+
+  { name: "Push", hint: "The grey block can't be pinched. Push it home with another block.",
+    blocks: [{ color: "grey", at: [0.5, 0.4] }, { color: "red", at: [0.2, 0.12] }],
+    goals:  [{ color: "grey", at: [0.5, 0.85] }, { color: "red", at: [0.8, 0.12] }] },
+];
 
 // Total bend (in degrees, summed over the finger's joints) that counts as
 // 0 % and 100 % curl. If a finger never reaches 100 %, lower its "closed" value.
@@ -140,6 +193,9 @@ const ctx      = canvas.getContext("2d");
 const statusEl = document.getElementById("status");
 const panel    = document.getElementById("panel");
 const errorEl  = document.getElementById("error");
+const topbar   = document.getElementById("topbar");
+const hintEl   = document.getElementById("hint");
+const bannerEl = document.getElementById("banner");
 
 let handLandmarker = null;      // the AI model, once loaded
 let facingMode     = "user";    // "user" = selfie camera, "environment" = back camera
@@ -168,6 +224,7 @@ async function startCamera() {
   const mirror = facingMode === "user";
   video.classList.toggle("mirrored", mirror);
   canvas.classList.toggle("mirrored", mirror);
+  setupZoom();
 }
 
 // ----------------------------- 2. MODEL --------------------------------------
@@ -217,30 +274,57 @@ function fingerCurl(points, fingerName) {
   return Math.min(100, Math.max(0, pct));
 }
 
-// ----------------------------- 4c. PINCH + BLOCKS ----------------------------
-let blocks      = [];             // each block: { x, y, size, color }  (x,y = top-left corner)
-let isPinching  = [false, false]; // per hand: is it pinching right now?
-let held        = [null, null];   // per hand: { block, dx, dy } while carrying a block
+// ----------------------------- 4c. PINCH, PHYSICS + LEVELS -------------------
+// Everything here is measured in camera-picture pixels.
+// Every "thing" (block, wall, goal, zone) is a rectangle: { x, y, w, h }
+// where x,y is the top-left corner.
+let level      = 0;               // which puzzle we are on (0 = first)
+let blocks     = [];              // movable:  + vx, vy (speed), color, canGrab
+let walls      = [];              // solid, never move
+let goals      = [];              // target squares: + color, done
+let noGrab     = [];              // zones where the hand cannot hold anything
+let play       = { x: 0, y: 0, w: 1, h: 1 };   // the area the puzzle lives in
+let unit       = 40;              // side of one block in pixels
+let won        = false;
+let nextTimer  = 0;
+let isPinching = [false, false];  // per hand: is it pinching right now?
+let held       = [null, null];    // per hand: { block, dx, dy } while carrying a block
+let screenZoom = 1;               // picture enlarged on screen (only when the camera can't zoom itself)
 
-// The camera picture is cropped to fill the screen, so only part of it is
-// visible. This returns that visible part, in camera-picture pixels.
-function visibleArea() {
-  const scale = Math.max(canvas.clientWidth / canvas.width, canvas.clientHeight / canvas.height);
-  const w = canvas.clientWidth / scale, h = canvas.clientHeight / scale;
-  return { x: (canvas.width - w) / 2, y: (canvas.height - h) / 2, w, h };
+// The camera picture is cropped to fill the screen, and the bars at the top and
+// bottom cover part of it. This returns the free part in between.
+function playArea() {
+  const scale  = Math.max(canvas.clientWidth / canvas.width, canvas.clientHeight / canvas.height) * screenZoom;
+  const w      = canvas.clientWidth / scale, h = canvas.clientHeight / scale;
+  const top    = topbar.getBoundingClientRect().bottom / scale;
+  const bottom = (window.innerHeight - panel.getBoundingClientRect().top) / scale;
+  return { x: (canvas.width - w) / 2, y: (canvas.height - h) / 2 + top,
+           w, h: Math.max(50, h - top - bottom) };
 }
 
-// Put the blocks back in a 2x2 grid in the middle of the screen.
-function resetBlocks() {
-  const area = visibleArea();
-  const size = Math.min(area.w, area.h) * 0.2;
-  const cx = area.x + area.w / 2, cy = area.y + area.h / 2;
-  blocks = BLOCK_COLORS.map((color, i) => ({
-    x: cx + (i % 2 ? 0.3 : -1.3) * size,
-    y: cy + (i < 2 ? -1.3 : 0.3) * size,
-    size, color,
-  }));
+// Build level number n from the LEVELS list in the settings.
+function loadLevel(n) {
+  clearTimeout(nextTimer);
+  level = (n + LEVELS.length) % LEVELS.length;      // after the last level, start over
+  const L = LEVELS[level];
+  play = playArea();
+  unit = Math.min(play.w, play.h) * BLOCK_SIZE;
+
+  // Levels use fractions (0..1) of the play area; turn them into pixels.
+  const X = (f) => play.x + f * play.w, Y = (f) => play.y + f * play.h;
+  const square = (at, size) => ({ x: X(at[0]) - size / 2, y: Y(at[1]) - size / 2, w: size, h: size });
+  const rect   = (r) => ({ x: X(r[0]), y: Y(r[1]), w: r[2] * play.w, h: r[3] * play.h });
+
+  blocks = L.blocks.map(b => ({ ...square(b.at, unit), vx: 0, vy: 0,
+                                color: COLORS[b.color], canGrab: b.color !== "grey" }));
+  goals  = L.goals.map(g => ({ ...square(g.at, unit * (g.size ?? 1.7)), color: COLORS[g.color], done: false }));
+  walls  = (L.walls  ?? []).map(rect);
+  noGrab = (L.noGrab ?? []).map(rect);
+
   held = [null, null];
+  won = false;
+  hintEl.textContent = `Level ${level + 1}/${LEVELS.length} · ${L.name}: ${L.hint}`;
+  bannerEl.style.display = "none";
 }
 
 // Is hand number `i` pinching, and where? `points` are the flat picture landmarks.
@@ -263,34 +347,115 @@ function getPinch(points, i) {
   };
 }
 
-// Pick up, carry and drop blocks.
-function updateBlocks(hands) {
-  const area = visibleArea();
+// Is the point p inside rectangle r (made `pad` pixels bigger on every side)?
+function pointIn(p, r, pad = 0) {
+  return p.x > r.x - pad && p.x < r.x + r.w + pad && p.y > r.y - pad && p.y < r.y + r.h + pad;
+}
+const isHeld = (block) => held.some(hd => hd && hd.block === block);
+
+// If rectangles a and b overlap, return how far to move `a` to get it out of
+// `b` by the shortest way ({x, y}, one of them is 0). If they don't, return null.
+function overlap(a, b) {
+  const dx = (a.x + a.w / 2) - (b.x + b.w / 2);
+  const dy = (a.y + a.h / 2) - (b.y + b.h / 2);
+  const ox = (a.w + b.w) / 2 - Math.abs(dx);     // how deep they overlap sideways
+  const oy = (a.h + b.h) / 2 - Math.abs(dy);     // ... and up/down
+  if (ox <= 0 || oy <= 0) return null;
+  return ox < oy ? { x: dx < 0 ? -ox : ox, y: 0 } : { x: 0, y: dy < 0 ? -oy : oy };
+}
+
+// Move everything forward by `dt` seconds.
+function physics(dt, hands) {
+  // --- hands: pick up and let go ---
   for (let i = 0; i < MAX_HANDS; i++) {
     const pinch = hands[i]?.pinch;
-    if (!pinch || !pinch.active) { held[i] = null; continue; }   // let go
+    const blocked = pinch && noGrab.some(zone => pointIn(pinch, zone));
+    if (!pinch || !pinch.active || blocked) { held[i] = null; continue; }   // let go
 
     // Pinch just started: is there a block under the fingers? (top one first)
     if (pinch.started) {
       for (let b = blocks.length - 1; b >= 0; b--) {
-        const block = blocks[b], pad = block.size * 0.15;        // a little forgiving
-        const inside = pinch.x > block.x - pad && pinch.x < block.x + block.size + pad &&
-                       pinch.y > block.y - pad && pinch.y < block.y + block.size + pad;
-        const taken = held.some(hd => hd && hd.block === block);
-        if (inside && !taken) {
+        const block = blocks[b];
+        if (block.canGrab && !isHeld(block) && pointIn(pinch, block, unit * 0.25)) {
           held[i] = { block, dx: block.x - pinch.x, dy: block.y - pinch.y };
           blocks.splice(b, 1); blocks.push(block);               // draw it on top
           break;
         }
       }
     }
+  }
 
-    // Carry: the block follows the pinch point, but stays on screen.
-    if (held[i]) {
-      const { block, dx, dy } = held[i];
-      block.x = Math.min(area.x + area.w - block.size, Math.max(area.x, pinch.x + dx));
-      block.y = Math.min(area.y + area.h - block.size, Math.max(area.y, pinch.y + dy));
+  // --- movement, in a few small steps so fast blocks can't jump through walls ---
+  const STEPS = 4, step = dt / STEPS, maxSpeed = MAX_SPEED * unit;
+  for (let s = 0; s < STEPS; s++) {
+    // A held block is pulled towards the pinch point like on a rubber band.
+    // Because it gets a real speed, it keeps moving when you let go = a throw.
+    for (let i = 0; i < MAX_HANDS; i++) {
+      if (!held[i]) continue;
+      const { block, dx, dy } = held[i], pinch = hands[i].pinch;
+      block.vx = (pinch.x + dx - block.x) * FOLLOW;
+      block.vy = (pinch.y + dy - block.y) * FOLLOW;
     }
+
+    for (const b of blocks) {
+      const speed = Math.hypot(b.vx, b.vy);
+      if (speed > maxSpeed) { b.vx *= maxSpeed / speed; b.vy *= maxSpeed / speed; }
+      b.x += b.vx * step;
+      b.y += b.vy * step;
+    }
+
+    // Block against block: push them apart half each, and swap their speed
+    // along the direction they hit (like two pucks bumping).
+    for (let i = 0; i < blocks.length; i++) {
+      for (let j = i + 1; j < blocks.length; j++) {
+        const a = blocks[i], b = blocks[j], push = overlap(a, b);
+        if (!push) continue;
+        a.x += push.x / 2; a.y += push.y / 2;
+        b.x -= push.x / 2; b.y -= push.y / 2;
+        const axis = push.x ? "vx" : "vy";
+        const closing = (a[axis] - b[axis]) * (push.x || push.y);   // negative = moving into each other
+        if (closing < 0) {
+          const change = (a[axis] - b[axis]) * (1 + BOUNCE) / 2;
+          a[axis] -= change;
+          b[axis] += change;
+        }
+      }
+    }
+
+    // Block against walls and the edge of the play area: push out and bounce.
+    for (const b of blocks) {
+      for (const wall of walls) {
+        const push = overlap(b, wall);
+        if (!push) continue;
+        b.x += push.x; b.y += push.y;
+        if (push.x && b.vx * push.x < 0) b.vx = -b.vx * BOUNCE;
+        if (push.y && b.vy * push.y < 0) b.vy = -b.vy * BOUNCE;
+      }
+      if (b.x < play.x)                 { b.x = play.x;                 if (b.vx < 0) b.vx = -b.vx * BOUNCE; }
+      if (b.x + b.w > play.x + play.w)  { b.x = play.x + play.w - b.w;  if (b.vx > 0) b.vx = -b.vx * BOUNCE; }
+      if (b.y < play.y)                 { b.y = play.y;                 if (b.vy < 0) b.vy = -b.vy * BOUNCE; }
+      if (b.y + b.h > play.y + play.h)  { b.y = play.y + play.h - b.h;  if (b.vy > 0) b.vy = -b.vy * BOUNCE; }
+    }
+  }
+
+  // --- friction: free blocks slow down a little every frame, then stop ---
+  const keep = Math.exp(-FRICTION * dt);
+  for (const b of blocks) {
+    if (isHeld(b)) continue;
+    b.vx *= keep; b.vy *= keep;
+    if (Math.hypot(b.vx, b.vy) < unit * 0.1) b.vx = b.vy = 0;
+  }
+
+  // --- goals: done when a block of the same colour rests on it, not held ---
+  for (const g of goals) {
+    g.done = blocks.some(b => b.color === g.color && !isHeld(b) && b.vx === 0 && b.vy === 0 &&
+                              pointIn({ x: b.x + b.w / 2, y: b.y + b.h / 2 }, g));
+  }
+  if (!won && goals.every(g => g.done)) {
+    won = true;
+    bannerEl.textContent = level === LEVELS.length - 1 ? "All levels done!" : "Level complete!";
+    bannerEl.style.display = "block";
+    nextTimer = setTimeout(() => loadLevel(level + 1), 1800);
   }
 }
 
@@ -299,18 +464,44 @@ function draw(result, hands) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const w = canvas.width, h = canvas.height;
 
-  // Blocks first, so the hand skeleton is drawn on top of them.
+  // The level first, so the hand skeleton is drawn on top of it.
+  ctx.strokeStyle = "rgba(255,255,255,.35)";                 // edge of the play area
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(play.x, play.y, play.w, play.h);
+
+  ctx.fillStyle = "rgba(255,60,60,.22)";                     // no-grab zones
+  for (const z of noGrab) ctx.fillRect(z.x, z.y, z.w, z.h);
+
+  for (const g of goals) {                                   // goals: dashed until solved
+    ctx.globalAlpha = g.done ? 0.45 : 0.2;
+    ctx.fillStyle = g.color;
+    ctx.fillRect(g.x, g.y, g.w, g.h);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = g.color;
+    ctx.lineWidth = g.done ? 5 : 2.5;
+    ctx.setLineDash(g.done ? [] : [8, 6]);
+    ctx.strokeRect(g.x, g.y, g.w, g.h);
+    ctx.setLineDash([]);
+  }
+
+  ctx.fillStyle = "#e8eef5";                                 // walls
+  for (const wall of walls) ctx.fillRect(wall.x, wall.y, wall.w, wall.h);
+
   for (const block of blocks) {
-    const isHeld = held.some(hd => hd && hd.block === block);
-    ctx.globalAlpha = 0.85;
+    ctx.globalAlpha = 0.9;
     ctx.fillStyle = block.color;
     ctx.beginPath();
-    ctx.roundRect(block.x, block.y, block.size, block.size, block.size * 0.15);
+    ctx.roundRect(block.x, block.y, block.w, block.h, block.w * 0.15);
     ctx.fill();
     ctx.globalAlpha = 1;
     ctx.strokeStyle = "#ffffff";
-    ctx.lineWidth = isHeld ? 5 : 1.5;
+    ctx.lineWidth = isHeld(block) ? 5 : 1.5;
     ctx.stroke();
+    if (!block.canGrab) {                                    // mark blocks you can't pinch
+      ctx.strokeStyle = "#495057";
+      ctx.lineWidth = 3;
+      ctx.strokeRect(block.x + block.w * 0.3, block.y + block.h * 0.3, block.w * 0.4, block.h * 0.4);
+    }
   }
 
   // A ring at each pinch point: hollow = open, filled = pinching.
@@ -374,7 +565,7 @@ function updatePanel(hands) {
 }
 
 // ----------------------------- 3. MAIN LOOP ----------------------------------
-let frames = 0, fps = 0, fpsTimer = performance.now();
+let frames = 0, fps = 0, fpsTimer = performance.now(), lastPhysicsTime = performance.now();
 
 function loop() {
   requestAnimationFrame(loop);              // run again on the next screen refresh
@@ -386,7 +577,7 @@ function loop() {
   if (canvas.width !== video.videoWidth) {
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
-    resetBlocks();
+    loadLevel(level);
   }
 
   const result = handLandmarker.detectForVideo(video, performance.now());
@@ -412,7 +603,12 @@ function loop() {
   // Forget the memory for hands that have left the picture.
   for (let i = hands.length; i < smoothed.length; i++) { smoothed[i] = {}; isPinching[i] = false; }
 
-  updateBlocks(hands);
+  // How much time passed since the last frame (never more than 0.05 s,
+  // so a hiccup doesn't make blocks teleport).
+  const now = performance.now();
+  const dt = Math.min(0.05, (now - lastPhysicsTime) / 1000);
+  lastPhysicsTime = now;
+  physics(dt, hands);
   draw(result, hands);
 
   window.handData = hands;
@@ -420,13 +616,54 @@ function loop() {
 
   // Frames-per-second counter, updated twice a second.
   frames++;
-  const now = performance.now();
   if (now - fpsTimer > 500) {
     fps = Math.round(frames * 1000 / (now - fpsTimer));
     frames = 0; fpsTimer = now;
-    statusEl.textContent = `${fps} FPS · ${hands.length} hand${hands.length === 1 ? "" : "s"} · ${video.videoWidth}×${video.videoHeight}`;
+    statusEl.textContent = `${fps} FPS · ${hands.length} hand${hands.length === 1 ? "" : "s"}`;
   }
 }
+
+// ----------------------------- ZOOM ------------------------------------------
+// Two ways to zoom:
+//   1. Real camera zoom, if the phone's camera offers it (sharper, and the
+//      hand model also sees the zoomed picture).
+//   2. Otherwise we simply enlarge the picture on screen.
+const zoomEl = document.getElementById("zoom"), zoomLabel = document.getElementById("zoomLabel");
+const stage  = document.getElementById("stage");
+let zoomTrack = null;             // the camera, when it can zoom by itself
+
+// Called every time a camera is started: set the slider up for that camera.
+function setupZoom() {
+  const track = video.srcObject.getVideoTracks()[0];
+  const range = track.getCapabilities?.().zoom;            // e.g. { min:1, max:8, step:0.1 }
+  screenZoom = 1;
+  stage.style.transform = "";
+  if (range && range.max > range.min) {
+    zoomTrack = track;
+    zoomEl.min = range.min; zoomEl.max = range.max; zoomEl.step = range.step || 0.1;
+    zoomEl.value = track.getSettings().zoom ?? range.min;
+  } else {
+    zoomTrack = null;
+    zoomEl.min = 1; zoomEl.max = 3; zoomEl.step = 0.1; zoomEl.value = 1;
+  }
+  zoomLabel.textContent = Number(zoomEl.value).toFixed(1) + "×";
+  if (handLandmarker) loadLevel(level);
+}
+
+// While dragging the slider.
+zoomEl.oninput = () => {
+  const z = Number(zoomEl.value);
+  zoomLabel.textContent = z.toFixed(1) + "×";
+  if (zoomTrack) {
+    zoomTrack.applyConstraints({ advanced: [{ zoom: z }] }).catch(e => console.warn("zoom failed:", e));
+  } else {
+    screenZoom = z;
+    stage.style.transform = `scale(${z})`;
+  }
+};
+// When the slider is let go: with screen zoom less of the picture is visible,
+// so rebuild the level to fit what you can see.
+zoomEl.onchange = () => { if (!zoomTrack && handLandmarker) loadLevel(level); };
 
 // ----------------------------- BUTTONS ---------------------------------------
 document.getElementById("startBtn").onclick = async () => {
@@ -438,6 +675,7 @@ document.getElementById("startBtn").onclick = async () => {
     document.getElementById("start").style.display = "none";
     statusEl.textContent = "Loading hand model (a few MB, first time only)…";
     await loadModel();
+    loadLevel(0);
     // Stop the phone screen from dimming while tracking (ignored if unsupported).
     navigator.wakeLock?.request("screen").catch(() => {});
     loop();
@@ -456,7 +694,10 @@ document.getElementById("flipBtn").onclick = async () => {
   try { await startCamera(); } catch (e) { statusEl.textContent = "Flip failed: " + e.message; }
 };
 
-document.getElementById("resetBtn").onclick = resetBlocks;
+document.getElementById("resetBtn").onclick = () => loadLevel(level);       // restart this level
+document.getElementById("nextBtn").onclick  = () => loadLevel(level + 1);   // skip to the next one
+// Turning the phone changes the play area, so rebuild the level to fit.
+window.addEventListener("resize", () => { if (canvas.width > 1 && video.videoWidth) loadLevel(level); });
 
 buildPanel();
 </script>
