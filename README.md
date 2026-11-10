@@ -12,6 +12,7 @@ Hand tracking that runs entirely in the phone browser (MediaPipe Hand Landmarker
 - Nothing is uploaded; the camera picture stays on the device
 
 - Spell page: fist then open hand = fireball, point = lightning, two fingers = frost, fast open-hand swipe = gust
+- Spell combos: gust + fireball = supercharge, lightning + fireball = storm burst, frost then lightning = shatter
 
 Open it: https://kiwiman1814.github.io/hand-tracker/
 
