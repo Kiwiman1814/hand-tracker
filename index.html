@@ -234,26 +234,65 @@ async function startCamera() {
 }
 
 // ----------------------------- 2. MODEL --------------------------------------
+// The model can run on the graphics chip ("GPU", fast) or the processor
+// ("CPU", slower but works everywhere). On some phones the GPU version loads
+// fine but then never finds a hand, without any error. So we start on the GPU
+// and keep a CPU copy ready to double-check it (see checkGpu further down).
+// Add ?cpu to the page address to skip the GPU completely.
+let engine     = "GPU";           // which one is in use right now
+let cpuBackup  = null;            // the spare CPU copy
+let lastCheck  = 0, misses = 0;
+
 async function loadModel() {
   const files = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
 
-  const options = (delegate) => ({
+  const create = (delegate) => HandLandmarker.createFromOptions(files, {
     baseOptions: {
       modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-      delegate,                       // "GPU" is fast, "CPU" works everywhere
+      delegate,
     },
     runningMode: "VIDEO",
     numHands: MAX_HANDS,
   });
 
-  try {
-    handLandmarker = await HandLandmarker.createFromOptions(files, options("GPU"));
-  } catch (e) {
-    console.warn("GPU failed, using CPU instead:", e);
-    handLandmarker = await HandLandmarker.createFromOptions(files, options("CPU"));
+  handLandmarker = null;
+  if (!location.search.includes("cpu")) {
+    try { handLandmarker = await create("GPU"); engine = "GPU"; }
+    catch (e) { console.warn("GPU failed, using CPU instead:", e); }
   }
+  if (!handLandmarker) { handLandmarker = await create("CPU"); engine = "CPU"; }
+  if (engine === "GPU") create("CPU").then(m => { cpuBackup = m; }).catch(() => {});
 }
+
+// Switch to the CPU copy for the rest of the session.
+function useCpu(why) {
+  console.warn("Switching to CPU:", why);
+  handLandmarker = cpuBackup;
+  cpuBackup = null;
+  engine = "CPU";
+}
+
+// While the GPU sees no hand, ask the CPU copy now and then. If the CPU finds
+// a hand twice in a row where the GPU found none, the GPU is not to be trusted.
+function checkGpu(result, now) {
+  if (engine !== "GPU" || !cpuBackup) return false;
+  if (result.landmarks.length > 0) { misses = 0; return false; }
+  if (now - lastCheck < 1000) return false;
+  lastCheck = now;
+  misses = cpuBackup.detectForVideo(video, now).landmarks.length > 0 ? misses + 1 : 0;
+  if (misses < 2) return false;
+  useCpu("GPU found no hand but CPU did");
+  return true;
+}
+
+// Show problems on screen, since a phone has no error console to look at.
+function showError(message) {
+  statusEl.textContent = "Error: " + message;
+  statusEl.style.color = "#ff8a80";
+}
+window.addEventListener("error", (e) => showError(e.message));
+window.addEventListener("unhandledrejection", (e) => showError(e.reason?.message ?? String(e.reason)));
 
 // ----------------------------- 4a. MATH --------------------------------------
 // Angle (degrees) between the direction a->b and the direction b->c.
@@ -589,7 +628,15 @@ function loop() {
     loadLevel(level);
   }
 
-  const result = handLandmarker.detectForVideo(video, performance.now());
+  const frameTime = performance.now();
+  let result;
+  try {
+    result = handLandmarker.detectForVideo(video, frameTime);
+  } catch (e) {
+    if (engine === "GPU" && cpuBackup) { useCpu(e.message); return; }   // GPU crashed: carry on with the CPU
+    throw e;
+  }
+  if (checkGpu(result, frameTime)) return;     // just switched to CPU, start fresh next frame
 
   // "worldLandmarks" are real 3D positions in metres - better for angles
   // than the flat picture positions, because they don't change with camera angle.
@@ -629,7 +676,8 @@ function loop() {
   if (now - fpsTimer > 500) {
     fps = Math.round(frames * 1000 / (now - fpsTimer));
     frames = 0; fpsTimer = now;
-    statusEl.textContent = `${fps} FPS · ${hands.length} hand${hands.length === 1 ? "" : "s"}`;
+    statusEl.textContent = `${fps} FPS · ${hands.length} hand${hands.length === 1 ? "" : "s"} · ${engine}`;
+    statusEl.style.color = "";
   }
 }
 
@@ -896,6 +944,14 @@ document.getElementById("flipBtn").onclick = async () => {
   facingMode = facingMode === "user" ? "environment" : "user";
   try { await startCamera(); } catch (e) { statusEl.textContent = "Flip failed: " + e.message; }
 };
+
+// Phones stop the camera when the browser goes to the background. Start it again on return.
+document.addEventListener("visibilitychange", () => {
+  const track = video.srcObject?.getVideoTracks()[0];
+  if (!document.hidden && handLandmarker && (!track || track.readyState === "ended")) {
+    startCamera().catch(e => showError(e.message));
+  }
+});
 
 document.getElementById("resetBtn").onclick = () => loadLevel(level);       // restart this level
 document.getElementById("nextBtn").onclick  = () => loadLevel(level + 1);   // skip to the next one
